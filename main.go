@@ -24,7 +24,7 @@ func beginSeg(db ctxDB, query string, args ...interface{}) (seg *xray.Segment) {
 		logrus.Warn("nil context, forget call WithContext?") //只是warn而不是panic，免得不小心没用WithContext导致服务不可用
 		return
 	}
-	_, seg = xray.BeginSubsegment(db.ctx, "mysql-"+db.source)
+	_, seg = xray.BeginSubsegment(db.ctx, db.source)
 	seg.Namespace = "remote"
 	seg.GetSQL().SanitizedQuery = PrintSQL(query, args...)
 	return
