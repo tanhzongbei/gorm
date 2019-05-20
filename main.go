@@ -1,14 +1,64 @@
 package gorm
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/aws/aws-xray-sdk-go/xray"
+	"github.com/sirupsen/logrus"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
 )
+
+type ctxDB struct {
+	dbSQL  SQLCommon
+	ctx    context.Context
+	source string
+}
+
+func beginSeg(db ctxDB, query string, args ...interface{}) (seg *xray.Segment) {
+	if db.ctx == nil {
+		logrus.Warn("nil context, forget call WithContext?") //只是warn而不是panic，免得不小心没用WithContext导致服务不可用
+		return
+	}
+	_, seg = xray.BeginSubsegment(db.ctx, "mysql-"+db.source)
+	seg.Namespace = "remote"
+	seg.GetSQL().SanitizedQuery = PrintSQL(query, args...)
+	return
+}
+func closeSeg(seg *xray.Segment, err error) {
+	if seg != nil {
+		seg.Close(err)
+	}
+}
+
+func (db ctxDB) Exec(query string, args ...interface{}) (result sql.Result, err error) {
+	seg := beginSeg(db, query, args...)
+	result, err = db.dbSQL.Exec(query, args...) //FIXME: 是否需要替换成ExecContent
+	closeSeg(seg, err)
+	return
+}
+func (db ctxDB) Prepare(query string) (stmt *sql.Stmt, err error) {
+	seg := beginSeg(db, query)
+	stmt, err = db.dbSQL.Prepare(query)
+	closeSeg(seg, err)
+	return
+}
+func (db ctxDB) Query(query string, args ...interface{}) (rows *sql.Rows, err error) {
+	seg := beginSeg(db, query, args...)
+	rows, err = db.dbSQL.Query(query, args...)
+	closeSeg(seg, err)
+	return
+}
+func (db ctxDB) QueryRow(query string, args ...interface{}) (row *sql.Row) {
+	seg := beginSeg(db, query, args...)
+	row = db.dbSQL.QueryRow(query, args...)
+	closeSeg(seg, nil)
+	return
+}
 
 // DB contains information for current db connection
 type DB struct {
@@ -17,8 +67,8 @@ type DB struct {
 	Error        error
 	RowsAffected int64
 
-	// single db
-	db                SQLCommon
+	// interface改成struct
+	db                ctxDB
 	blockGlobalUpdate bool
 	logMode           logModeValue
 	logger            logger
@@ -39,6 +89,17 @@ const (
 	noLogMode
 	detailedLogMode
 )
+
+func (s *DB) WithContext(ctx context.Context) *DB {
+	if ctx == nil {
+		panic("nil context")
+		return s
+	}
+	clone := s.clone() //NOTE: 复制避免多个线程使用同一个ctx
+	clone.db.ctx = ctx
+	clone.db.source = GetSource(2)
+	return clone
+}
 
 // Open initialize a new db connection, need to import driver first, e.g:
 //
@@ -79,7 +140,7 @@ func Open(dialect string, args ...interface{}) (db *DB, err error) {
 	}
 
 	db = &DB{
-		db:        dbSQL,
+		db:        ctxDB{dbSQL: dbSQL},
 		logger:    defaultLogger,
 		callbacks: DefaultCallback,
 		dialect:   newDialect(dialect, dbSQL),
@@ -111,7 +172,7 @@ type closer interface {
 
 // Close close current db connection.  If database connection is not an io.Closer, returns an error.
 func (s *DB) Close() error {
-	if db, ok := s.parent.db.(closer); ok {
+	if db, ok := s.parent.db.dbSQL.(closer); ok {
 		return db.Close()
 	}
 	return errors.New("can't close current db")
@@ -120,7 +181,7 @@ func (s *DB) Close() error {
 // DB get `*sql.DB` from current connection
 // If the underlying database connection is not a *sql.DB, returns nil
 func (s *DB) DB() *sql.DB {
-	db, _ := s.db.(*sql.DB)
+	db, _ := s.db.dbSQL.(*sql.DB)
 	return db
 }
 
@@ -506,9 +567,9 @@ func (s *DB) Debug() *DB {
 // Begin begin a transaction
 func (s *DB) Begin() *DB {
 	c := s.clone()
-	if db, ok := c.db.(sqlDb); ok && db != nil {
+	if db, ok := c.db.dbSQL.(sqlDb); ok && db != nil {
 		tx, err := db.Begin()
-		c.db = interface{}(tx).(SQLCommon)
+		c.db.dbSQL = interface{}(tx).(SQLCommon)
 
 		c.dialect.SetDB(c.db)
 		c.AddError(err)
@@ -521,7 +582,7 @@ func (s *DB) Begin() *DB {
 // Commit commit a transaction
 func (s *DB) Commit() *DB {
 	var emptySQLTx *sql.Tx
-	if db, ok := s.db.(sqlTx); ok && db != nil && db != emptySQLTx {
+	if db, ok := s.db.dbSQL.(sqlTx); ok && db != nil && db != emptySQLTx {
 		s.AddError(db.Commit())
 	} else {
 		s.AddError(ErrInvalidTransaction)
@@ -532,12 +593,32 @@ func (s *DB) Commit() *DB {
 // Rollback rollback a transaction
 func (s *DB) Rollback() *DB {
 	var emptySQLTx *sql.Tx
-	if db, ok := s.db.(sqlTx); ok && db != nil && db != emptySQLTx {
+	if db, ok := s.db.dbSQL.(sqlTx); ok && db != nil && db != emptySQLTx {
 		s.AddError(db.Rollback())
 	} else {
 		s.AddError(ErrInvalidTransaction)
 	}
 	return s
+}
+
+func (s *DB) CloseTx(ctx context.Context, errp *error) {
+	_, seg := xray.BeginSubsegment(ctx, GetSource(2))
+	defer func() { seg.Close(*errp) }()
+
+	if *errp != nil {
+		if err := s.Rollback().Error; err != nil {
+			logrus.WithFields(logrus.Fields{
+				"error":          (*errp).Error(),
+				"rollback_error": err.Error(),
+			}).Error("rollback fail")
+			*errp = err
+		}
+	} else {
+		if err := s.Commit().Error; err != nil {
+			logrus.WithField("commit_error", err.Error()).Error("commit fail")
+			*errp = err
+		}
+	}
 }
 
 // NewRecord check if value's primary key is blank
