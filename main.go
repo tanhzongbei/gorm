@@ -14,9 +14,21 @@ import (
 )
 
 type ctxDB struct {
-	dbSQL  SQLCommon
-	ctx    context.Context
-	source string
+	dbSQL      SQLCommon //主库，写或事务操作
+	dbSQLSlave SQLCommon //从库，非事务读操作
+	ctx        context.Context
+	source     string
+}
+
+//用在query中，如果是事务或是写操作用主库，否则用从库
+func (db ctxDB) getDBSQLInNoTxQuery() (dbSQL SQLCommon) {
+	dbSQL = db.dbSQL
+	if _, ok := dbSQL.(*sql.Tx); !ok { //不是事务才用读库
+		if db.dbSQLSlave != nil { //从库存在才用从库，否则还是用主库
+			dbSQL = db.dbSQLSlave
+		}
+	}
+	return
 }
 
 func beginSeg(db ctxDB, query string, args ...interface{}) (seg *xray.Segment) {
@@ -49,13 +61,13 @@ func (db ctxDB) Prepare(query string) (stmt *sql.Stmt, err error) {
 }
 func (db ctxDB) Query(query string, args ...interface{}) (rows *sql.Rows, err error) {
 	seg := beginSeg(db, query, args...)
-	rows, err = db.dbSQL.Query(query, args...)
+	rows, err = db.getDBSQLInNoTxQuery().Query(query, args...)
 	closeSeg(seg, err)
 	return
 }
 func (db ctxDB) QueryRow(query string, args ...interface{}) (row *sql.Row) {
 	seg := beginSeg(db, query, args...)
-	row = db.dbSQL.QueryRow(query, args...)
+	row = db.getDBSQLInNoTxQuery().QueryRow(query, args...)
 	closeSeg(seg, nil)
 	return
 }
@@ -158,6 +170,41 @@ func Open(dialect string, args ...interface{}) (db *DB, err error) {
 	return
 }
 
+func openAndPing(driver, source string) (db *sql.DB, err error) {
+	db, err = sql.Open(driver, source)
+	if err != nil {
+		return
+	}
+	// Send a ping to make sure the database connection is alive.
+	if err = db.Ping(); err != nil {
+		db.Close()
+	}
+	return
+}
+
+func OpenMasterAndSlave(driver, master, slave string) (db *DB, err error) {
+	var ctxDB ctxDB
+
+	ctxDB.dbSQL, err = openAndPing(driver, master)
+	if err != nil {
+		return
+	}
+
+	ctxDB.dbSQLSlave, err = openAndPing(driver, slave)
+	if err != nil {
+		return
+	}
+
+	db = &DB{
+		db:        ctxDB,
+		logger:    defaultLogger,
+		callbacks: DefaultCallback,
+		dialect:   newDialect(driver, ctxDB), //NOTE: dialect也同时使用主库和从库
+	}
+	db.parent = db
+	return
+}
+
 // New clone a new db connection without search conditions
 func (s *DB) New() *DB {
 	clone := s.clone()
@@ -178,10 +225,17 @@ func (s *DB) Close() error {
 	return errors.New("can't close current db")
 }
 
+//NOTE: 返回的是主库
 // DB get `*sql.DB` from current connection
 // If the underlying database connection is not a *sql.DB, returns nil
 func (s *DB) DB() *sql.DB {
 	db, _ := s.db.dbSQL.(*sql.DB)
+	return db
+}
+
+//返回从库
+func (s *DB) DBSlave() *sql.DB {
+	db, _ := s.db.dbSQLSlave.(*sql.DB)
 	return db
 }
 
@@ -564,6 +618,7 @@ func (s *DB) Debug() *DB {
 	return s.clone().LogMode(true)
 }
 
+//NOTE: begin用主库
 // Begin begin a transaction
 func (s *DB) Begin() *DB {
 	c := s.clone()
@@ -579,6 +634,7 @@ func (s *DB) Begin() *DB {
 	return c
 }
 
+//NOTE: commit用主库
 // Commit commit a transaction
 func (s *DB) Commit() *DB {
 	var emptySQLTx *sql.Tx
@@ -590,6 +646,7 @@ func (s *DB) Commit() *DB {
 	return s
 }
 
+//NOTE: rollback用主库
 // Rollback rollback a transaction
 func (s *DB) Rollback() *DB {
 	var emptySQLTx *sql.Tx
