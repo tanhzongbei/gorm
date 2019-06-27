@@ -72,7 +72,11 @@ func PrintSQL(query string, args ...interface{}) (sql string) {
 				}
 			} else if r, ok := value.(driver.Valuer); ok {
 				if value, err := r.Value(); err == nil && value != nil {
-					formattedValues = append(formattedValues, fmt.Sprintf("'%v'", value))
+					if bs, ok := value.([]byte); ok { //NOTE: 只有json column才这样
+						formattedValues = append(formattedValues, fmt.Sprintf("'%s'", bs))
+					} else {
+						formattedValues = append(formattedValues, fmt.Sprintf("'%v'", value))
+					}
 				} else {
 					formattedValues = append(formattedValues, "NULL")
 				}
