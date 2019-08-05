@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // NowFunc returns current time, this function is exported in order to be able
@@ -125,12 +126,56 @@ func fileWithLineNum() string {
 	return ""
 }
 
-func GetSource(skip int) (name string) {
+//这样就能外面自定义
+var GetSource = func(skip int) (name string) {
 	name = "unknown"
 	if pc, _, line, ok := runtime.Caller(skip); ok {
 		name = fmt.Sprintf("%s:%d", runtime.FuncForPC(pc).Name(), line)
 	}
-	return
+	return xRayNameReplace(name)
+}
+
+var xRayValidSymbolMap = map[rune]struct{}{
+	'_':  {},
+	'.':  {},
+	':':  {},
+	'/':  {},
+	'%':  {},
+	'&':  {},
+	'#':  {},
+	'=':  {},
+	'+':  {},
+	'\\': {},
+	'-':  {},
+	'@':  {},
+}
+
+func xRayNameRuneIsValid(r rune) bool {
+	if unicode.IsDigit(r) {
+		return true
+	}
+	if unicode.IsLetter(r) {
+		return true
+	}
+	if unicode.IsSpace(r) {
+		return true
+	}
+	if _, ok := xRayValidSymbolMap[r]; ok {
+		return true
+	}
+	return false
+}
+
+func xRayNameReplace(name string) string {
+	rs := make([]rune, len(name))
+	for i, r := range name {
+		if xRayNameRuneIsValid(r) {
+			rs[i] = r
+		} else {
+			rs[i] = '-'
+		}
+	}
+	return string(rs)
 }
 
 func isBlank(value reflect.Value) bool {
