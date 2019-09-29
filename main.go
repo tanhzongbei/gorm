@@ -31,6 +31,14 @@ func (db ctxDB) getDBSQLInNoTxQuery() (dbSQL SQLCommon) {
 	return
 }
 
+//明确表示使用主库:
+// 由于上面的getDBSQLInNoTxQuery方法在取不到dbSQLSlave时候会使用主库，
+// 所以这里简单起见，把dbSQLSlave置nil，
+// 如果没有主库，那么后面执行sql时候会报空指针的错误，符合逻辑
+func (db *ctxDB) useMaster() {
+	db.dbSQLSlave = nil
+}
+
 func beginSeg(db ctxDB, query string, args ...interface{}) (seg *xray.Segment) {
 	if db.ctx == nil {
 		logrus.Warn("nil context, forget call WithContext?") //只是warn而不是panic，免得不小心没用WithContext导致服务不可用
@@ -237,6 +245,16 @@ func (s *DB) DB() *sql.DB {
 func (s *DB) DBSlave() *sql.DB {
 	db, _ := s.db.dbSQLSlave.(*sql.DB)
 	return db
+}
+
+//明确表示使用主库:
+// 由于从库和主库有几毫秒的延迟，
+// 所以写主库，然后立刻读从库这一行时候，可能未读到修改（如果用事务读，就读的是主库，没这个问题），
+// 因此增加这个Master方法
+func (s *DB) Master() *DB {
+	clone := s.clone()
+	clone.db.useMaster()
+	return clone
 }
 
 // CommonDB return the underlying `*sql.DB` or `*sql.Tx` instance, mainly intended to allow coexistence with legacy non-GORM code.
