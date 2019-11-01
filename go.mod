@@ -13,5 +13,5 @@ require (
 
 	github.com/lib/pq v1.1.0
 	github.com/mattn/go-sqlite3 v1.10.0
-	github.com/sirupsen/logrus v1.2.0
+	github.com/sirupsen/logrus v1.4.2
 )

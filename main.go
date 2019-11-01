@@ -39,44 +39,67 @@ func (db *ctxDB) useMaster() {
 	db.dbSQLSlave = nil
 }
 
-func beginSeg(db ctxDB, query string, args ...interface{}) (seg *xray.Segment) {
-	if db.ctx == nil {
-		logrus.Warn("nil context, forget call WithContext?") //只是warn而不是panic，免得不小心没用WithContext导致服务不可用
-		return
+//为了记录trace_id而直接打日志
+func beginSeg(db ctxDB, query string, args ...interface{}) func(err error, r func() *int64) {
+	sql := PrintSQL(query, args...)
+	entry := logrus.WithContext(db.ctx).WithFields(logrus.Fields{
+		"sql":    sql,
+		"stack":  nil,
+		"source": db.source,
+	})
+	start := time.Now()
+	var seg *xray.Segment
+	if db.ctx != nil {
+		_, seg := xray.BeginSubsegment(db.ctx, db.source)
+		seg.Namespace = "remote"
+		seg.GetSQL().SanitizedQuery = sql
 	}
-	_, seg = xray.BeginSubsegment(db.ctx, db.source)
-	seg.Namespace = "remote"
-	seg.GetSQL().SanitizedQuery = PrintSQL(query, args...)
-	return
-}
-func closeSeg(seg *xray.Segment, err error) {
-	if seg != nil {
-		seg.Close(err)
+	return func(err error, getRows func() *int64) {
+		end := time.Now()
+		if seg != nil {
+			seg.Close(err)
+		}
+
+		entry = entry.WithField("duration", end.Sub(start).String())
+		if r := getRows(); r != nil {
+			entry = entry.WithField("exec_rows", *r) //只打印执行语句的行数，不打印查询语句行数
+		}
+		if err != nil {
+			entry.WithError(err).Error()
+		} else {
+			if db.ctx == nil {
+				entry.Warn("nil context, forget call WithContext?") //只是warn而不是panic，免得不小心没用WithContext导致服务不可用
+			} else {
+				entry.Debug()
+			}
+		}
 	}
 }
 
+var rowsNil = func() *int64 { return nil }
+
 func (db ctxDB) Exec(query string, args ...interface{}) (result sql.Result, err error) {
-	seg := beginSeg(db, query, args...)
+	defer beginSeg(db, query, args...)(err, func() *int64 {
+		rows, _ := result.RowsAffected()
+		return &rows
+	})
 	result, err = db.dbSQL.Exec(query, args...) //FIXME: 是否需要替换成ExecContent
-	closeSeg(seg, err)
 	return
 }
 func (db ctxDB) Prepare(query string) (stmt *sql.Stmt, err error) {
-	seg := beginSeg(db, query)
+	defer beginSeg(db, query)(err, rowsNil)
 	stmt, err = db.dbSQL.Prepare(query)
-	closeSeg(seg, err)
 	return
 }
 func (db ctxDB) Query(query string, args ...interface{}) (rows *sql.Rows, err error) {
-	seg := beginSeg(db, query, args...)
+	//NOTE: 不能用rows.Next()来获取长度，因为外面会用rows.Next()把数据拷贝出来，因此不打印行数了
+	defer beginSeg(db, query, args...)(err, rowsNil)
 	rows, err = db.getDBSQLInNoTxQuery().Query(query, args...)
-	closeSeg(seg, err)
 	return
 }
 func (db ctxDB) QueryRow(query string, args ...interface{}) (row *sql.Row) {
-	seg := beginSeg(db, query, args...)
+	defer beginSeg(db, query, args...)(nil, rowsNil)
 	row = db.getDBSQLInNoTxQuery().QueryRow(query, args...)
-	closeSeg(seg, nil)
 	return
 }
 
