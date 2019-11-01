@@ -40,7 +40,7 @@ func (db *ctxDB) useMaster() {
 }
 
 //为了记录trace_id而直接打日志
-func beginSeg(db ctxDB, query string, args ...interface{}) func(err error, r func() *int64) {
+func beginSeg(db ctxDB, query string, args ...interface{}) func(errPtr *error, r func() *int64) {
 	sql := PrintSQL(query, args...)
 	entry := logrus.WithContext(db.ctx).WithFields(logrus.Fields{
 		"sql":    sql,
@@ -54,7 +54,11 @@ func beginSeg(db ctxDB, query string, args ...interface{}) func(err error, r fun
 		seg.Namespace = "remote"
 		seg.GetSQL().SanitizedQuery = sql
 	}
-	return func(err error, getRows func() *int64) {
+	return func(errPtr *error, getRows func() *int64) {
+		var err error
+		if errPtr != nil {
+			err = *errPtr
+		}
 		end := time.Now()
 		if seg != nil {
 			seg.Close(err)
@@ -79,21 +83,24 @@ func beginSeg(db ctxDB, query string, args ...interface{}) func(err error, r fun
 var rowsNil = func() *int64 { return nil }
 
 func (db ctxDB) Exec(query string, args ...interface{}) (result sql.Result, err error) {
-	defer beginSeg(db, query, args...)(err, func() *int64 {
-		rows, _ := result.RowsAffected()
-		return &rows
+	defer beginSeg(db, query, args...)(&err, func() *int64 {
+		if result != nil {
+			rows, _ := result.RowsAffected()
+			return &rows
+		}
+		return nil
 	})
 	result, err = db.dbSQL.Exec(query, args...) //FIXME: 是否需要替换成ExecContent
 	return
 }
 func (db ctxDB) Prepare(query string) (stmt *sql.Stmt, err error) {
-	defer beginSeg(db, query)(err, rowsNil)
+	defer beginSeg(db, query)(&err, rowsNil)
 	stmt, err = db.dbSQL.Prepare(query)
 	return
 }
 func (db ctxDB) Query(query string, args ...interface{}) (rows *sql.Rows, err error) {
 	//NOTE: 不能用rows.Next()来获取长度，因为外面会用rows.Next()把数据拷贝出来，因此不打印行数了
-	defer beginSeg(db, query, args...)(err, rowsNil)
+	defer beginSeg(db, query, args...)(&err, rowsNil)
 	rows, err = db.getDBSQLInNoTxQuery().Query(query, args...)
 	return
 }
