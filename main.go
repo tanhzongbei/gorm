@@ -50,7 +50,7 @@ func beginSeg(db ctxDB, query string, args ...interface{}) func(errPtr *error, r
 	start := time.Now()
 	var seg *xray.Segment
 	if db.ctx != nil {
-		_, seg := xray.BeginSubsegment(db.ctx, db.source)
+		_, seg = xray.BeginSubsegment(db.ctx, db.source)
 		seg.Namespace = "remote"
 		seg.GetSQL().SanitizedQuery = sql
 	}
