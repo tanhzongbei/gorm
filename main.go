@@ -63,20 +63,25 @@ func beginSeg(db ctxDB, query string, args ...interface{}) func(errPtr *error, r
 		if seg != nil {
 			seg.Close(err)
 		}
+		duration := end.Sub(start)
 
-		entry = entry.WithField("duration", end.Sub(start).String())
+		entry = entry.WithField("duration", duration.String())
 		if r := getRows(); r != nil {
 			entry = entry.WithField("exec_rows", *r) //只打印执行语句的行数，不打印查询语句行数
 		}
 		if err != nil {
 			entry.WithError(err).Error()
-		} else {
-			if db.ctx == nil {
-				entry.Warn("nil context, forget call WithContext?") //只是warn而不是panic，免得不小心没用WithContext导致服务不可用
-			} else {
-				entry.Debug()
-			}
+			return
 		}
+		if duration >= 200*time.Millisecond {
+			entry.Warn("slow sql") //慢查询警告
+			return
+		}
+		if db.ctx == nil {
+			entry.Warn("nil context, forget call WithContext?") //只是warn而不是panic，免得不小心没用WithContext导致服务不可用
+			return
+		}
+		entry.Debug()
 	}
 }
 
