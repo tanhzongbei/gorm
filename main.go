@@ -84,11 +84,11 @@ var rowsNil = func() *int64 { return nil }
 
 func (db ctxDB) Exec(query string, args ...interface{}) (result sql.Result, err error) {
 	defer beginSeg(db, query, args...)(&err, func() *int64 {
-		if result != nil {
-			rows, _ := result.RowsAffected()
-			return &rows
+		if err != nil {
+			return nil
 		}
-		return nil
+		rows, _ := result.RowsAffected()
+		return &rows
 	})
 	result, err = db.dbSQL.Exec(query, args...) //FIXME: 是否需要替换成ExecContent
 	return
