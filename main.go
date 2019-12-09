@@ -715,9 +715,15 @@ func (s *DB) CloseTx(ctx context.Context, errp *error) {
 	_, seg := xray.BeginSubsegment(ctx, GetSource(2))
 	defer func() { seg.Close(*errp) }()
 
+	entry := logrus.WithContext(ctx)
+	if r := recover(); r != nil {
+		*errp = fmt.Errorf("panic:%v", r) //遇到panic则rollback
+		entry.WithError(*errp).Error("panic is captured, then will rollback")
+	}
+
 	if *errp != nil {
 		if err := s.Rollback().Error; err != nil {
-			logrus.WithFields(logrus.Fields{
+			entry.WithFields(logrus.Fields{
 				"error":          (*errp).Error(),
 				"rollback_error": err.Error(),
 			}).Error("rollback fail")
@@ -725,7 +731,7 @@ func (s *DB) CloseTx(ctx context.Context, errp *error) {
 		}
 	} else {
 		if err := s.Commit().Error; err != nil {
-			logrus.WithField("commit_error", err.Error()).Error("commit fail")
+			entry.WithField("commit_error", err.Error()).Error("commit fail")
 			*errp = err
 		}
 	}
