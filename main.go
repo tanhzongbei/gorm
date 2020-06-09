@@ -49,7 +49,7 @@ func beginSeg(db ctxDB, query string, args ...interface{}) func(errPtr *error, r
 	})
 	start := time.Now()
 	var seg *xray.Segment
-	if db.ctx != nil {
+	if db.ctx != nil && xray.GetSegment(db.ctx) != nil {
 		_, seg = xray.BeginSubsegment(db.ctx, db.source)
 		seg.Namespace = "remote"
 		seg.GetSQL().SanitizedQuery = sql
@@ -712,8 +712,10 @@ func (s *DB) Rollback() *DB {
 }
 
 func (s *DB) CloseTx(ctx context.Context, errp *error) {
-	_, seg := xray.BeginSubsegment(ctx, GetSource(2))
-	defer func() { seg.Close(*errp) }()
+	if xray.GetSegment(ctx) != nil {
+		_, seg := xray.BeginSubsegment(ctx, GetSource(2))
+		defer func() { seg.Close(*errp) }()
+	}
 
 	entry := logrus.WithContext(ctx)
 	if r := recover(); r != nil {
