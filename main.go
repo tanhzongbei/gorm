@@ -300,7 +300,7 @@ func (s *DB) Master() *DB {
 
 // CommonDB return the underlying `*sql.DB` or `*sql.Tx` instance, mainly intended to allow coexistence with legacy non-GORM code.
 func (s *DB) CommonDB() SQLCommon {
-	return s.db
+	return s.db.dbSQL
 }
 
 // Dialect get dialect
