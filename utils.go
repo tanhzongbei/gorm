@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // NowFunc returns current time, this function is exported in order to be able
@@ -25,8 +26,8 @@ var NowFunc = func() time.Time {
 var commonInitialisms = []string{"API", "ASCII", "CPU", "CSS", "DNS", "EOF", "GUID", "HTML", "HTTP", "HTTPS", "ID", "IP", "JSON", "LHS", "QPS", "RAM", "RHS", "RPC", "SLA", "SMTP", "SSH", "TLS", "TTL", "UID", "UI", "UUID", "URI", "URL", "UTF8", "VM", "XML", "XSRF", "XSS"}
 var commonInitialismsReplacer *strings.Replacer
 
-var goSrcRegexp = regexp.MustCompile(`jinzhu/gorm(@.*)?/.*.go`)
-var goTestRegexp = regexp.MustCompile(`jinzhu/gorm(@.*)?/.*test.go`)
+var goSrcRegexp = regexp.MustCompile(`gorm(@.*)?/.*.go`)
+var goTestRegexp = regexp.MustCompile(`gorm(@.*)?/.*test.go`)
 
 func init() {
 	var commonInitialismsForReplacer []string
@@ -123,6 +124,58 @@ func fileWithLineNum() string {
 		}
 	}
 	return ""
+}
+
+//这样就能外面自定义
+var GetSource = func(skip int) (name string) {
+	name = "unknown"
+	if pc, _, line, ok := runtime.Caller(skip); ok {
+		name = fmt.Sprintf("%s:%d", runtime.FuncForPC(pc).Name(), line)
+	}
+	return xRayNameReplace(name)
+}
+
+var xRayValidSymbolMap = map[rune]struct{}{
+	'_':  {},
+	'.':  {},
+	':':  {},
+	'/':  {},
+	'%':  {},
+	'&':  {},
+	'#':  {},
+	'=':  {},
+	'+':  {},
+	'\\': {},
+	'-':  {},
+	'@':  {},
+}
+
+func xRayNameRuneIsValid(r rune) bool {
+	if unicode.IsDigit(r) {
+		return true
+	}
+	if unicode.IsLetter(r) {
+		return true
+	}
+	if unicode.IsSpace(r) {
+		return true
+	}
+	if _, ok := xRayValidSymbolMap[r]; ok {
+		return true
+	}
+	return false
+}
+
+func xRayNameReplace(name string) string {
+	rs := make([]rune, len(name))
+	for i, r := range name {
+		if xRayNameRuneIsValid(r) {
+			rs[i] = r
+		} else {
+			rs[i] = '-'
+		}
+	}
+	return string(rs)
 }
 
 func isBlank(value reflect.Value) bool {

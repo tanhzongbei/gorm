@@ -5,11 +5,115 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/aws/aws-xray-sdk-go/xray"
+	"github.com/sirupsen/logrus"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
 )
+
+type ctxDB struct {
+	dbSQL      SQLCommon //主库，写或事务操作
+	dbSQLSlave SQLCommon //从库，非事务读操作
+	ctx        context.Context
+	source     string
+}
+
+//用在query中，如果是事务或是写操作用主库，否则用从库
+func (db ctxDB) getDBSQLInNoTxQuery() (dbSQL SQLCommon) {
+	dbSQL = db.dbSQL
+	if _, ok := dbSQL.(*sql.Tx); !ok { //不是事务才用读库
+		if db.dbSQLSlave != nil { //从库存在才用从库，否则还是用主库
+			dbSQL = db.dbSQLSlave
+		}
+	}
+	return
+}
+
+//明确表示使用主库:
+// 由于上面的getDBSQLInNoTxQuery方法在取不到dbSQLSlave时候会使用主库，
+// 所以这里简单起见，把dbSQLSlave置nil，
+// 如果没有主库，那么后面执行sql时候会报空指针的错误，符合逻辑
+func (db *ctxDB) useMaster() {
+	db.dbSQLSlave = nil
+}
+
+//为了记录trace_id而直接打日志
+func beginSeg(db ctxDB, query string, args ...interface{}) func(errPtr *error, r func() *int64) {
+	sql := PrintSQL(query, args...)
+	entry := logrus.WithContext(db.ctx).WithFields(logrus.Fields{
+		"sql":    sql,
+		"stack":  nil,
+		"source": db.source,
+	})
+	start := time.Now()
+	var seg *xray.Segment
+	if db.ctx != nil && xray.GetSegment(db.ctx) != nil {
+		_, seg = xray.BeginSubsegment(db.ctx, db.source)
+		seg.Namespace = "remote"
+		seg.GetSQL().SanitizedQuery = sql
+	}
+	return func(errPtr *error, getRows func() *int64) {
+		var err error
+		if errPtr != nil {
+			err = *errPtr
+		}
+		end := time.Now()
+		if seg != nil {
+			seg.Close(err)
+		}
+		duration := end.Sub(start)
+
+		entry = entry.WithField("duration", duration.String())
+		if r := getRows(); r != nil {
+			entry = entry.WithField("exec_rows", *r) //只打印执行语句的行数，不打印查询语句行数
+		}
+		if err != nil {
+			entry.WithError(err).Error()
+			return
+		}
+		if duration >= 200*time.Millisecond {
+			entry.Warn("slow sql") //慢查询警告
+			return
+		}
+		if db.ctx == nil {
+			entry.Warn("nil context, forget call WithContext?") //只是warn而不是panic，免得不小心没用WithContext导致服务不可用
+			return
+		}
+		entry.Debug()
+	}
+}
+
+var rowsNil = func() *int64 { return nil }
+
+func (db ctxDB) Exec(query string, args ...interface{}) (result sql.Result, err error) {
+	defer beginSeg(db, query, args...)(&err, func() *int64 {
+		if err != nil {
+			return nil
+		}
+		rows, _ := result.RowsAffected()
+		return &rows
+	})
+	result, err = db.dbSQL.Exec(query, args...) //FIXME: 是否需要替换成ExecContent
+	return
+}
+func (db ctxDB) Prepare(query string) (stmt *sql.Stmt, err error) {
+	defer beginSeg(db, query)(&err, rowsNil)
+	stmt, err = db.dbSQL.Prepare(query)
+	return
+}
+func (db ctxDB) Query(query string, args ...interface{}) (rows *sql.Rows, err error) {
+	//NOTE: 不能用rows.Next()来获取长度，因为外面会用rows.Next()把数据拷贝出来，因此不打印行数了
+	defer beginSeg(db, query, args...)(&err, rowsNil)
+	rows, err = db.getDBSQLInNoTxQuery().Query(query, args...)
+	return
+}
+func (db ctxDB) QueryRow(query string, args ...interface{}) (row *sql.Row) {
+	defer beginSeg(db, query, args...)(nil, rowsNil)
+	row = db.getDBSQLInNoTxQuery().QueryRow(query, args...)
+	return
+}
 
 // DB contains information for current db connection
 type DB struct {
@@ -18,8 +122,8 @@ type DB struct {
 	Error        error
 	RowsAffected int64
 
-	// single db
-	db                SQLCommon
+	// interface改成struct
+	db                ctxDB
 	blockGlobalUpdate bool
 	logMode           logModeValue
 	logger            logger
@@ -44,6 +148,17 @@ const (
 	detailedLogMode
 )
 
+func (s *DB) WithContext(ctx context.Context) *DB {
+	if ctx == nil {
+		panic("nil context")
+		return s
+	}
+	clone := s.clone() //NOTE: 复制避免多个线程使用同一个ctx
+	clone.db.ctx = ctx
+	clone.db.source = GetSource(2)
+	return clone
+}
+
 // Open initialize a new db connection, need to import driver first, e.g:
 //
 //     import _ "github.com/go-sql-driver/mysql"
@@ -51,10 +166,10 @@ const (
 //       db, err := gorm.Open("mysql", "user:password@/dbname?charset=utf8&parseTime=True&loc=Local")
 //     }
 // GORM has wrapped some drivers, for easier to remember driver's import path, so you could import the mysql driver with
-//    import _ "github.com/jinzhu/gorm/dialects/mysql"
-//    // import _ "github.com/jinzhu/gorm/dialects/postgres"
-//    // import _ "github.com/jinzhu/gorm/dialects/sqlite"
-//    // import _ "github.com/jinzhu/gorm/dialects/mssql"
+//    import _ "github.com/lun-zhang/gorm/dialects/mysql"
+//    // import _ "github.com/lun-zhang/gorm/dialects/postgres"
+//    // import _ "github.com/lun-zhang/gorm/dialects/sqlite"
+//    // import _ "github.com/lun-zhang/gorm/dialects/mssql"
 func Open(dialect string, args ...interface{}) (db *DB, err error) {
 	if len(args) == 0 {
 		err = errors.New("invalid database source")
@@ -83,7 +198,7 @@ func Open(dialect string, args ...interface{}) (db *DB, err error) {
 	}
 
 	db = &DB{
-		db:        dbSQL,
+		db:        ctxDB{dbSQL: dbSQL},
 		logger:    defaultLogger,
 		callbacks: DefaultCallback,
 		dialect:   newDialect(dialect, dbSQL),
@@ -101,6 +216,41 @@ func Open(dialect string, args ...interface{}) (db *DB, err error) {
 	return
 }
 
+func openAndPing(driver, source string) (db *sql.DB, err error) {
+	db, err = sql.Open(driver, source)
+	if err != nil {
+		return
+	}
+	// Send a ping to make sure the database connection is alive.
+	if err = db.Ping(); err != nil {
+		db.Close()
+	}
+	return
+}
+
+func OpenMasterAndSlave(driver, master, slave string) (db *DB, err error) {
+	var ctxDB ctxDB
+
+	ctxDB.dbSQL, err = openAndPing(driver, master)
+	if err != nil {
+		return
+	}
+
+	ctxDB.dbSQLSlave, err = openAndPing(driver, slave)
+	if err != nil {
+		return
+	}
+
+	db = &DB{
+		db:        ctxDB,
+		logger:    defaultLogger,
+		callbacks: DefaultCallback,
+		dialect:   newDialect(driver, ctxDB), //NOTE: dialect也同时使用主库和从库
+	}
+	db.parent = db
+	return
+}
+
 // New clone a new db connection without search conditions
 func (s *DB) New() *DB {
 	clone := s.clone()
@@ -115,20 +265,37 @@ type closer interface {
 
 // Close close current db connection.  If database connection is not an io.Closer, returns an error.
 func (s *DB) Close() error {
-	if db, ok := s.parent.db.(closer); ok {
+	if db, ok := s.parent.db.dbSQL.(closer); ok {
 		return db.Close()
 	}
 	return errors.New("can't close current db")
 }
 
+//NOTE: 返回的是主库
 // DB get `*sql.DB` from current connection
 // If the underlying database connection is not a *sql.DB, returns nil
 func (s *DB) DB() *sql.DB {
-	db, ok := s.db.(*sql.DB)
+	db, ok := s.db.dbSQL.(*sql.DB)
 	if !ok {
 		panic("can't support full GORM on currently status, maybe this is a TX instance.")
 	}
 	return db
+}
+
+//返回从库
+func (s *DB) DBSlave() *sql.DB {
+	db, _ := s.db.dbSQLSlave.(*sql.DB)
+	return db
+}
+
+//明确表示使用主库:
+// 由于从库和主库有几毫秒的延迟，
+// 所以写主库，然后立刻读从库这一行时候，可能未读到修改（如果用事务读，就读的是主库，没这个问题），
+// 因此增加这个Master方法
+func (s *DB) Master() *DB {
+	clone := s.clone()
+	clone.db.useMaster()
+	return clone
 }
 
 // CommonDB return the underlying `*sql.DB` or `*sql.Tx` instance, mainly intended to allow coexistence with legacy non-GORM code.
@@ -558,9 +725,9 @@ func (s *DB) Begin() *DB {
 // BeginTx begins a transaction with options
 func (s *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) *DB {
 	c := s.clone()
-	if db, ok := c.db.(sqlDb); ok && db != nil {
+	if db, ok := c.db.dbSQL.(sqlDb); ok && db != nil {
 		tx, err := db.BeginTx(ctx, opts)
-		c.db = interface{}(tx).(SQLCommon)
+		c.db.dbSQL = interface{}(tx).(SQLCommon)
 
 		c.dialect.SetDB(c.db)
 		c.AddError(err)
@@ -570,10 +737,11 @@ func (s *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) *DB {
 	return c
 }
 
+//NOTE: commit用主库
 // Commit commit a transaction
 func (s *DB) Commit() *DB {
 	var emptySQLTx *sql.Tx
-	if db, ok := s.db.(sqlTx); ok && db != nil && db != emptySQLTx {
+	if db, ok := s.db.dbSQL.(sqlTx); ok && db != nil && db != emptySQLTx {
 		s.AddError(db.Commit())
 	} else {
 		s.AddError(ErrInvalidTransaction)
@@ -581,10 +749,11 @@ func (s *DB) Commit() *DB {
 	return s
 }
 
+//NOTE: rollback用主库
 // Rollback rollback a transaction
 func (s *DB) Rollback() *DB {
 	var emptySQLTx *sql.Tx
-	if db, ok := s.db.(sqlTx); ok && db != nil && db != emptySQLTx {
+	if db, ok := s.db.dbSQL.(sqlTx); ok && db != nil && db != emptySQLTx {
 		if err := db.Rollback(); err != nil && err != sql.ErrTxDone {
 			s.AddError(err)
 		}
@@ -598,7 +767,7 @@ func (s *DB) Rollback() *DB {
 // committed.
 func (s *DB) RollbackUnlessCommitted() *DB {
 	var emptySQLTx *sql.Tx
-	if db, ok := s.db.(sqlTx); ok && db != nil && db != emptySQLTx {
+	if db, ok := s.db.dbSQL.(sqlTx); ok && db != nil && db != emptySQLTx {
 		err := db.Rollback()
 		// Ignore the error indicating that the transaction has already
 		// been committed.
@@ -609,6 +778,34 @@ func (s *DB) RollbackUnlessCommitted() *DB {
 		s.AddError(ErrInvalidTransaction)
 	}
 	return s
+}
+
+func (s *DB) CloseTx(ctx context.Context, errp *error) {
+	if xray.GetSegment(ctx) != nil {
+		_, seg := xray.BeginSubsegment(ctx, GetSource(2))
+		defer func() { seg.Close(*errp) }()
+	}
+
+	entry := logrus.WithContext(ctx)
+	if r := recover(); r != nil {
+		*errp = fmt.Errorf("panic:%v", r) //遇到panic则rollback
+		entry.WithError(*errp).Error("panic is captured, then will rollback")
+	}
+
+	if *errp != nil {
+		if err := s.Rollback().Error; err != nil {
+			entry.WithFields(logrus.Fields{
+				"error":          (*errp).Error(),
+				"rollback_error": err.Error(),
+			}).Error("rollback fail")
+			*errp = err
+		}
+	} else {
+		if err := s.Commit().Error; err != nil {
+			entry.WithField("commit_error", err.Error()).Error("commit fail")
+			*errp = err
+		}
+	}
 }
 
 // NewRecord check if value's primary key is blank
