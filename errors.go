@@ -1,21 +1,21 @@
 package gorm
 
 import (
-	"errors"
+	jg "github.com/jinzhu/gorm"
 	"strings"
 )
 
 var (
 	// ErrRecordNotFound returns a "record not found error". Occurs only when attempting to query the database with a struct; querying with a slice won't return this error
-	ErrRecordNotFound = errors.New("record not found")
+	ErrRecordNotFound = jg.ErrRecordNotFound
 	// ErrInvalidSQL occurs when you attempt a query with invalid SQL
-	ErrInvalidSQL = errors.New("invalid SQL")
+	ErrInvalidSQL = jg.ErrInvalidSQL
 	// ErrInvalidTransaction occurs when you are trying to `Commit` or `Rollback`
-	ErrInvalidTransaction = errors.New("no valid transaction")
+	ErrInvalidTransaction = jg.ErrInvalidTransaction
 	// ErrCantStartTransaction can't start transaction when you are trying to start one with `Begin`
-	ErrCantStartTransaction = errors.New("can't start transaction")
+	ErrCantStartTransaction = jg.ErrCantStartTransaction
 	// ErrUnaddressable unaddressable value
-	ErrUnaddressable = errors.New("using unaddressable value")
+	ErrUnaddressable = jg.ErrUnaddressable
 )
 
 // Errors contains all happened errors

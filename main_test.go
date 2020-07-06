@@ -1,12 +1,19 @@
 package gorm_test
 
+// Run tests
+// $ docker-compose up
+// $ ./test_all.sh
+
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,7 +50,7 @@ func OpenTestConnection() (db *gorm.DB, err error) {
 	case "mysql":
 		fmt.Println("testing mysql...")
 		if dbDSN == "" {
-			dbDSN = "gorm:gorm@tcp(localhost:9910)/gorm?charset=utf8&parseTime=True"
+			dbDSN = "root:123@tcp(localhost:3306)/gorm?charset=utf8&parseTime=True"
 		}
 		db, err = gorm.Open("mysql", dbDSN)
 	case "postgres":
@@ -175,6 +182,15 @@ func TestSetTable(t *testing.T) {
 	DB.Table("deleted_users").Find(&deletedUsers)
 	if len(deletedUsers) != 1 {
 		t.Errorf("Query from specified table")
+	}
+
+	var user User
+	DB.Table("deleted_users").First(&user, "name = ?", "DeletedUser")
+
+	user.Age = 20
+	DB.Table("deleted_users").Save(&user)
+	if DB.Table("deleted_users").First(&user, "name = ? AND age = ?", "DeletedUser", 20).RecordNotFound() {
+		t.Errorf("Failed to found updated user")
 	}
 
 	DB.Save(getPreparedUser("normal_user", "reset_table"))
@@ -419,6 +435,160 @@ func TestTransaction(t *testing.T) {
 	if err := DB.First(&User{}, "name = ?", "transcation-2").Error; err != nil {
 		t.Errorf("Should be able to find committed record")
 	}
+
+	tx3 := DB.Begin()
+	u3 := User{Name: "transcation-3"}
+	if err := tx3.Save(&u3).Error; err != nil {
+		t.Errorf("No error should raise")
+	}
+
+	if err := tx3.First(&User{}, "name = ?", "transcation-3").Error; err != nil {
+		t.Errorf("Should find saved record")
+	}
+
+	tx3.RollbackUnlessCommitted()
+
+	if err := tx.First(&User{}, "name = ?", "transcation").Error; err == nil {
+		t.Errorf("Should not find record after rollback")
+	}
+
+	tx4 := DB.Begin()
+	u4 := User{Name: "transcation-4"}
+	if err := tx4.Save(&u4).Error; err != nil {
+		t.Errorf("No error should raise")
+	}
+
+	if err := tx4.First(&User{}, "name = ?", "transcation-4").Error; err != nil {
+		t.Errorf("Should find saved record")
+	}
+
+	tx4.Commit()
+
+	tx4.RollbackUnlessCommitted()
+
+	if err := DB.First(&User{}, "name = ?", "transcation-4").Error; err != nil {
+		t.Errorf("Should be able to find committed record")
+	}
+}
+
+func assertPanic(t *testing.T, f func()) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf("The code did not panic")
+		}
+	}()
+	f()
+}
+
+func TestTransactionWithBlock(t *testing.T) {
+	// rollback
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		u := User{Name: "transcation"}
+		if err := tx.Save(&u).Error; err != nil {
+			t.Errorf("No error should raise")
+		}
+
+		if err := tx.First(&User{}, "name = ?", "transcation").Error; err != nil {
+			t.Errorf("Should find saved record")
+		}
+
+		return errors.New("the error message")
+	})
+
+	if err.Error() != "the error message" {
+		t.Errorf("Transaction return error will equal the block returns error")
+	}
+
+	if err := DB.First(&User{}, "name = ?", "transcation").Error; err == nil {
+		t.Errorf("Should not find record after rollback")
+	}
+
+	// commit
+	DB.Transaction(func(tx *gorm.DB) error {
+		u2 := User{Name: "transcation-2"}
+		if err := tx.Save(&u2).Error; err != nil {
+			t.Errorf("No error should raise")
+		}
+
+		if err := tx.First(&User{}, "name = ?", "transcation-2").Error; err != nil {
+			t.Errorf("Should find saved record")
+		}
+		return nil
+	})
+
+	if err := DB.First(&User{}, "name = ?", "transcation-2").Error; err != nil {
+		t.Errorf("Should be able to find committed record")
+	}
+
+	// panic will rollback
+	assertPanic(t, func() {
+		DB.Transaction(func(tx *gorm.DB) error {
+			u3 := User{Name: "transcation-3"}
+			if err := tx.Save(&u3).Error; err != nil {
+				t.Errorf("No error should raise")
+			}
+
+			if err := tx.First(&User{}, "name = ?", "transcation-3").Error; err != nil {
+				t.Errorf("Should find saved record")
+			}
+
+			panic("force panic")
+		})
+	})
+
+	if err := DB.First(&User{}, "name = ?", "transcation-3").Error; err == nil {
+		t.Errorf("Should not find record after panic rollback")
+	}
+}
+
+func TestTransaction_NoErrorOnRollbackAfterCommit(t *testing.T) {
+	tx := DB.Begin()
+	u := User{Name: "transcation"}
+	if err := tx.Save(&u).Error; err != nil {
+		t.Errorf("No error should raise")
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		t.Errorf("Commit should not raise error")
+	}
+
+	if err := tx.Rollback().Error; err != nil {
+		t.Errorf("Rollback should not raise error")
+	}
+}
+
+func TestTransactionReadonly(t *testing.T) {
+	dialect := os.Getenv("GORM_DIALECT")
+	if dialect == "" {
+		dialect = "sqlite"
+	}
+	switch dialect {
+	case "mssql", "sqlite":
+		t.Skipf("%s does not support readonly transactions\n", dialect)
+	}
+
+	tx := DB.Begin()
+	u := User{Name: "transcation"}
+	if err := tx.Save(&u).Error; err != nil {
+		t.Errorf("No error should raise")
+	}
+	tx.Commit()
+
+	tx = DB.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err := tx.First(&User{}, "name = ?", "transcation").Error; err != nil {
+		t.Errorf("Should find saved record")
+	}
+
+	if sqlTx, ok := tx.CommonDB().(*sql.Tx); !ok || sqlTx == nil {
+		t.Errorf("Should return the underlying sql.Tx")
+	}
+
+	u = User{Name: "transcation-2"}
+	if err := tx.Save(&u).Error; err == nil {
+		t.Errorf("Error should have been raised in a readonly transaction")
+	}
+
+	tx.Rollback()
 }
 
 func TestRow(t *testing.T) {
@@ -674,6 +844,11 @@ func TestJoinsWithSelect(t *testing.T) {
 
 	var results []result
 	DB.Table("users").Select("name, emails.email").Joins("left join emails on emails.user_id = users.id").Where("name = ?", "joins_with_select").Scan(&results)
+
+	sort.Slice(results, func(i, j int) bool {
+		return strings.Compare(results[i].Email, results[j].Email) < 0
+	})
+
 	if len(results) != 2 || results[0].Email != "join1@example.com" || results[1].Email != "join2@example.com" {
 		t.Errorf("Should find all two emails with Join select")
 	}
@@ -1164,6 +1339,30 @@ func TestCountWithQueryOption(t *testing.T) {
 	}
 }
 
+func TestQueryHint1(t *testing.T) {
+	db := DB.New()
+
+	_, err := db.Model(User{}).Raw("select 1").Rows()
+
+	if err != nil {
+		t.Error("Unexpected error on query count with query_option")
+	}
+}
+
+func TestQueryHint2(t *testing.T) {
+	type TestStruct struct {
+		ID   string `gorm:"primary_key"`
+		Name string
+	}
+	DB.DropTable(&TestStruct{})
+	DB.AutoMigrate(&TestStruct{})
+
+	data := TestStruct{ID: "uuid", Name: "hello"}
+	if err := DB.Set("gorm:query_hint", "/*master*/").Save(&data).Error; err != nil {
+		t.Error("Unexpected error on query count with query_option")
+	}
+}
+
 func TestFloatColumnPrecision(t *testing.T) {
 	if dialect := os.Getenv("GORM_DIALECT"); dialect != "mysql" && dialect != "sqlite" {
 		t.Skip()
@@ -1195,12 +1394,11 @@ func TestWhereUpdates(t *testing.T) {
 		OwnerEntity OwnerEntity `gorm:"polymorphic:Owner"`
 	}
 
-	db := DB.Debug()
-	db.DropTable(&SomeEntity{})
-	db.AutoMigrate(&SomeEntity{})
+	DB.DropTable(&SomeEntity{})
+	DB.AutoMigrate(&SomeEntity{})
 
 	a := SomeEntity{Name: "test"}
-	db.Model(&a).Where(a).Updates(SomeEntity{Name: "test2"})
+	DB.Model(&a).Where(a).Updates(SomeEntity{Name: "test2"})
 }
 
 func BenchmarkGorm(b *testing.B) {
