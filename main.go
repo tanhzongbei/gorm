@@ -78,7 +78,7 @@ func beginSeg(db ctxDB, query string, args ...interface{}) func(errPtr *error, r
 			return
 		}
 		if db.ctx == nil {
-			entry.Warn("nil context, forget call WithContext?") //只是warn而不是panic，免得不小心没用WithContext导致服务不可用
+			entry.Trace("nil context, forget call WithContext?") //不然比较吵人
 			return
 		}
 		entry.Debug()
