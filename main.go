@@ -799,7 +799,7 @@ func (s *DB) DoTx(f func(tx *DB) (err error)) (err error) {
 // 否则会commit
 func (s *DB) DoTxCtx(ctx context.Context, f func(ctx context.Context, tx *DB) (err error)) (err error) {
 	tx := s.Begin()
-	defer tx.closeTx(ctx, &err, 3)
+	defer tx.closeTx(ctx, &err)
 	return f(ctx, tx)
 }
 
@@ -816,13 +816,13 @@ func (s *DB) DoTxCtx(ctx context.Context, f func(ctx context.Context, tx *DB) (e
 //   return nil
 // }
 func (s *DB) CloseTx(ctx context.Context, errp *error) {
-	s.closeTx(ctx, errp, 3)
+	s.closeTx(ctx, errp)
 }
 
 // skip用于打印调用者所在函数位置
-func (s *DB) closeTx(ctx context.Context, errp *error, skip int) {
+func (s *DB) closeTx(ctx context.Context, errp *error) {
 	if xray.GetSegment(ctx) != nil {
-		_, seg := xray.BeginSubsegment(ctx, GetSource(skip))
+		_, seg := xray.BeginSubsegment(ctx, GetSource(3))
 		defer func() { seg.Close(*errp) }()
 	}
 
