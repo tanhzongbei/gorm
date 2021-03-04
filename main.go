@@ -780,9 +780,49 @@ func (s *DB) RollbackUnlessCommitted() *DB {
 	return s
 }
 
+// 启动一个事务去执行函数f
+// 会创建一个有cancel的, 退出f()后cancel, 这个ctx仅仅是为了复用代码, 没有任何其他作用
+func (s *DB) DoTx(f func(tx *DB) (err error)) (err error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// 没ctx就没法trace，所以skip用不到了
+	return s.DoTxCtx(ctx, func(ctx context.Context, tx *DB) (err error) {
+		return f(tx)
+	})
+}
+
+// 启动一个事务去执行函数f
+// 将你传入的ctx传递下去,
+// 这里的ctx
+// 这里的ctx只有在捕获了panic或者rollback失败或者commit失败, 才会有用
+// 若f()返回了err!=nil或者f()发生panic, 则会rollback
+// 否则会commit
+func (s *DB) DoTxCtx(ctx context.Context, f func(ctx context.Context, tx *DB) (err error)) (err error) {
+	tx := s.Begin()
+	defer tx.closeTx(ctx, &err, 3)
+	return f(ctx, tx)
+}
+
+// 用法:
+// func example(ctx context.Context)(err error){
+//   tx := db.Begin()
+//   defer tx.CloseTx(ctx, &err)
+//   if err := tx.Where(xxx). // 执行你的sql语句
+//     Table(yyy).
+//     UpdateColumns(zzz).
+//     Error; err !=nil{
+//       return err
+//   }
+//   return nil
+// }
 func (s *DB) CloseTx(ctx context.Context, errp *error) {
+	s.closeTx(ctx, errp, 3)
+}
+
+// skip用于打印调用者所在函数位置
+func (s *DB) closeTx(ctx context.Context, errp *error, skip int) {
 	if xray.GetSegment(ctx) != nil {
-		_, seg := xray.BeginSubsegment(ctx, GetSource(2))
+		_, seg := xray.BeginSubsegment(ctx, GetSource(skip))
 		defer func() { seg.Close(*errp) }()
 	}
 
