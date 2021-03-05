@@ -77,11 +77,11 @@ func beginSeg(db ctxDB, query string, args ...interface{}) func(errPtr *error, r
 			entry.Warn("slow sql") //慢查询警告
 			return
 		}
+		entry.Debug()
 		if db.ctx == nil {
 			entry.Trace("nil context, forget call WithContext?") //不然比较吵人
 			return
 		}
-		entry.Debug()
 	}
 }
 
